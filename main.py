@@ -10941,6 +10941,7 @@ async def lookINTO_SimError_message(locations: Sequence[str]) -> dict:
 # ============================================================================
 
 _HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("MCP_HEARTBEAT_INTERVAL_SECONDS", "5"))
+_KEEPALIVE_FAILED = False
 
 
 async def _emit_keepalive(ctx, progress: float, message: str) -> None:
@@ -10955,7 +10956,9 @@ async def _emit_keepalive(ctx, progress: float, message: str) -> None:
         return
     try:
         meta = request_context.meta
-        progress_token = meta.progressToken if meta is not None else None
+        # meta 运行时是 dict（RequestParamsMeta 为 TypedDict），且 SDK 已把 wire 上的
+        # progressToken 规范化成 progress_token，所以只能按键取值，属性访问会抛错。
+        progress_token = meta.get("progress_token") if meta is not None else None
         related_request_id = str(request_context.request_id)
         session = request_context.session
 
@@ -10968,16 +10971,22 @@ async def _emit_keepalive(ctx, progress: float, message: str) -> None:
                 related_request_id=related_request_id,
             )
         else:
-            # 客户端未声明 progressToken 时退化为日志通知，SSE 流仍会收到事件。
+            # 客户端未声明 progressToken 时退化为日志通知。2026-07-28 起日志改为逐请求
+            # opt-in，客户端 _meta 不带 logLevel 时 SDK 直接不发，仅旧协议握手仍生效。
             await session.send_log_message(
                 level="info",
                 data=message,
                 logger="brain-mcp",
                 related_request_id=related_request_id,
             )
-    except Exception:
-        # 心跳失败绝不能影响真实工具调用。
-        pass
+    except Exception as e:
+        # 心跳失败绝不能影响真实工具调用，但必须留下一次痕迹：这里的静默会让
+        # 取值写错之类的缺陷表现得像"保活机制本来就没触发"。
+        global _KEEPALIVE_FAILED
+        if not _KEEPALIVE_FAILED:
+            _KEEPALIVE_FAILED = True
+            logger.warning("keep-alive heartbeat failed, disabled for this process: %s: %s",
+                           type(e).__name__, e)
 
 
 async def _run_with_heartbeat(coro_factory, ctx, label: str):
