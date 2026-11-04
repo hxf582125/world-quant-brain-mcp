@@ -7656,7 +7656,8 @@ def _slim_multisim(obj):
         else:
             new_results.append(r)
     out = {k: payload.get(k) for k in ("success", "message", "total_requested", "total_created",
-                                       "multisimulation_id") if k in payload}
+                                       "multisimulation_id", "multisimulation_location",
+                                       "multisim_status") if k in payload}
     out["alpha_results"] = new_results
     return _rewrap(out, w)
 
@@ -10925,6 +10926,113 @@ async def lookINTO_SimError_message(locations: Sequence[str]) -> dict:
                 "raw": None
             })
     return _slim_text_lookup({"results": results}, n=2000)
+
+
+# ============================================================================
+# Progress / keep-alive heartbeat
+# ----------------------------------------------------------------------------
+# 部分 MCP 客户端（含本 IDE 内置客户端）在 Streamable HTTP 下调用工具时，会
+# 在工具执行期间等待当前请求 SSE 流上的事件；如果长时间没有任何事件就会判定
+# 超时。而 mcp SDK 的 Context.report_progress() 不会附带 related_request_id，
+# 导致进度通知被路由到独立的 GET 流而不是当前 POST 请求流，客户端收不到。
+#
+# 这里在所有工具调用外包一层心跳：执行期间定时向当前请求流发送进度通知（无
+# progressToken 时退化为日志通知），保持连接活跃，避免客户端超时。
+# ============================================================================
+
+_HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("MCP_HEARTBEAT_INTERVAL_SECONDS", "5"))
+
+
+async def _emit_keepalive(ctx, progress: float, message: str) -> None:
+    """向当前请求的 SSE 流发送一条进度（或日志）通知，保持连接活跃。"""
+    if ctx is None:
+        return
+    try:
+        request_context = ctx.request_context
+    except Exception:
+        return
+    if request_context is None:
+        return
+    try:
+        meta = request_context.meta
+        progress_token = meta.progressToken if meta is not None else None
+        related_request_id = str(request_context.request_id)
+        session = request_context.session
+
+        if progress_token is not None:
+            await session.send_progress_notification(
+                progress_token=progress_token,
+                progress=progress,
+                total=None,
+                message=message,
+                related_request_id=related_request_id,
+            )
+        else:
+            # 客户端未声明 progressToken 时退化为日志通知，SSE 流仍会收到事件。
+            await session.send_log_message(
+                level="info",
+                data=message,
+                logger="brain-mcp",
+                related_request_id=related_request_id,
+            )
+    except Exception:
+        # 心跳失败绝不能影响真实工具调用。
+        pass
+
+
+async def _run_with_heartbeat(coro_factory, ctx, label: str):
+    """在心跳任务伴随下运行一个可等待对象。"""
+    if ctx is None:
+        return await coro_factory()
+    try:
+        ctx.request_id
+    except Exception:
+        # 不在有效请求上下文内，直接执行，不发送心跳。
+        return await coro_factory()
+
+    interval = _HEARTBEAT_INTERVAL_SECONDS
+    stop = asyncio.Event()
+
+    async def _beat() -> None:
+        await _emit_keepalive(ctx, 0.0, f"{label} started")
+        n = 0
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+                break
+            except asyncio.TimeoutError:
+                n += 1
+                await _emit_keepalive(
+                    ctx,
+                    float(n),
+                    f"{label} ... {int(n * interval)}s elapsed",
+                )
+
+    task = asyncio.create_task(_beat())
+    try:
+        return await coro_factory()
+    finally:
+        stop.set()
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+# 用带心跳的调用包装 ToolManager.call_tool，使所有工具在长耗时期间保持连接活跃。
+_original_call_tool = mcp._tool_manager.call_tool
+
+
+async def _call_tool_with_heartbeat(name, arguments, context=None, convert_result=False):
+    async def _run():
+        return await _original_call_tool(name, arguments, context=context, convert_result=convert_result)
+
+    return await _run_with_heartbeat(_run, context, f"Running tool '{name}'")
+
+
+mcp._tool_manager.call_tool = _call_tool_with_heartbeat
+
 
 # --- Main entry point ---
 if __name__ == "__main__":
